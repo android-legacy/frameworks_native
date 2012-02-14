@@ -347,6 +347,7 @@ void Layer::onDraw(const sp<const DisplayDevice>& hw, const Region& clip) const
     }
 
     bool blackOutLayer = isProtected() || (isSecure() && !hw->isSecure());
+
 #ifdef DECIDE_TEXTURE_TARGET
     GLuint currentTextureTarget = mSurfaceTexture->getCurrentTextureTarget();
 #endif
@@ -361,7 +362,7 @@ void Layer::onDraw(const sp<const DisplayDevice>& hw, const Region& clip) const
 
         // Set things up for texturing.
 #ifdef DECIDE_TEXTURE_TARGET
-	glBindTexture(currentTextureTarget, mTextureName);
+        glBindTexture(currentTextureTarget, mTextureName);
 #else
         glBindTexture(GL_TEXTURE_EXTERNAL_OES, mTextureName);
 #endif
@@ -398,7 +399,7 @@ void Layer::onDraw(const sp<const DisplayDevice>& hw, const Region& clip) const
         glEnable(currentTextureTarget);
 #else
         glDisable(GL_TEXTURE_EXTERNAL_OES);
-        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_TEXTURE_2D);
 #endif
     }
 
