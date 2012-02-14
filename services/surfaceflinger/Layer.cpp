@@ -502,15 +502,8 @@ void Layer::onDraw(const sp<const DisplayDevice>& hw, const Region& clip) const
         // is probably going to have something visibly wrong.
     }
 
-    bool canAllowGPU = false;
-#ifdef QCOM_BSP
-    if(isProtected()) {
-        char property[PROPERTY_VALUE_MAX];
-        if ((property_get("persist.gralloc.cp.level3", property, NULL) > 0) &&
-                (atoi(property) == 1)) {
-            canAllowGPU = true;
-        }
-    }
+#ifdef DECIDE_TEXTURE_TARGET
+    GLuint currentTextureTarget = mSurfaceFlingerConsumer->getCurrentTextureTarget();
 #endif
 
     bool blackOutLayer = isProtected() || (isSecure() && !hw->isSecure());
@@ -526,40 +519,34 @@ void Layer::onDraw(const sp<const DisplayDevice>& hw, const Region& clip) const
         mSurfaceFlingerConsumer->setFilteringEnabled(useFiltering);
         mSurfaceFlingerConsumer->getTransformMatrix(textureMatrix);
 
-        if (mSurfaceFlingerConsumer->getTransformToDisplayInverse()) {
-
-            /*
-             * the code below applies the display's inverse transform to the texture transform
-             */
-
-            // create a 4x4 transform matrix from the display transform flags
-            const mat4 flipH(-1,0,0,0,  0,1,0,0, 0,0,1,0, 1,0,0,1);
-            const mat4 flipV( 1,0,0,0, 0,-1,0,0, 0,0,1,0, 0,1,0,1);
-            const mat4 rot90( 0,1,0,0, -1,0,0,0, 0,0,1,0, 1,0,0,1);
-
-            mat4 tr;
-            uint32_t transform = hw->getOrientationTransform();
-            if (transform & NATIVE_WINDOW_TRANSFORM_ROT_90)
-                tr = tr * rot90;
-            if (transform & NATIVE_WINDOW_TRANSFORM_FLIP_H)
-                tr = tr * flipH;
-            if (transform & NATIVE_WINDOW_TRANSFORM_FLIP_V)
-                tr = tr * flipV;
-
-            // calculate the inverse
-            tr = inverse(tr);
-
-            // and finally apply it to the original texture matrix
-            const mat4 texTransform(mat4(static_cast<const float*>(textureMatrix)) * tr);
-            memcpy(textureMatrix, texTransform.asArray(), sizeof(textureMatrix));
-        }
-
         // Set things up for texturing.
-        mTexture.setDimensions(mActiveBuffer->getWidth(), mActiveBuffer->getHeight());
-        mTexture.setFiltering(useFiltering);
-        mTexture.setMatrix(textureMatrix);
-
-        engine.setupLayerTexturing(mTexture);
+#ifdef DECIDE_TEXTURE_TARGET
+        glBindTexture(currentTextureTarget, mTextureName);
+#else
+        glBindTexture(GL_TEXTURE_EXTERNAL_OES, mTextureName);
+#endif
+        GLenum filter = GL_NEAREST;
+        if (useFiltering) {
+            filter = GL_LINEAR;
+        }
+#ifdef DECIDE_TEXTURE_TARGET
+        glTexParameterx(currentTextureTarget, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameterx(currentTextureTarget, GL_TEXTURE_MIN_FILTER, filter);
+#else
+        glTexParameterx(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, filter);
+        glTexParameterx(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, filter);
+#endif
+        glMatrixMode(GL_TEXTURE);
+        glLoadMatrixf(textureMatrix);
+        glMatrixMode(GL_MODELVIEW);
+#ifdef DECIDE_TEXTURE_TARGET
+        glDisable((currentTextureTarget == GL_TEXTURE_2D) ?
+                    GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D);
+        glEnable(currentTextureTarget);
+#else
+        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_TEXTURE_EXTERNAL_OES);
+#endif
     } else {
         engine.setupLayerBlackedOut();
     }
@@ -1085,23 +1072,12 @@ Region Layer::latchBuffer(bool& recomputeVisibleRegions)
         };
 
 
-        Reject r(mDrawingState, getCurrentState(), recomputeVisibleRegions);
-
-        status_t updateResult = mSurfaceFlingerConsumer->updateTexImage(&r);
-        if (updateResult == BufferQueue::PRESENT_LATER) {
-            // Producer doesn't want buffer to be displayed yet.  Signal a
-            // layer update so we check again at the next opportunity.
-            mFlinger->signalLayerUpdate();
-            return outDirtyRegion;
-        }
-
-        // Decrement the queued-frames count.  Signal another event if we
-        // have more frames pending.
-        if (android_atomic_dec(&mQueuedFrames) > 1) {
-            mFlinger->signalLayerUpdate();
-        }
-
-        if (updateResult != NO_ERROR) {
+        Reject r(mDrawingState, currentState(), recomputeVisibleRegions);
+#ifdef DECIDE_TEXTURE_TARGET
+        if (mSurfaceFlingerConsumer->updateTexImage(&r, true) != NO_ERROR) {
+#else
+        if (mSurfaceFlingerConsumer->updateTexImage(&r) != NO_ERROR) {
+#endif
             // something happened!
             recomputeVisibleRegions = true;
             return outDirtyRegion;
