@@ -154,9 +154,8 @@ SurfaceFlinger::SurfaceFlinger()
         mDebugInTransaction(0),
         mLastTransactionTime(0),
         mBootFinished(false),
-        mPrimaryHWVsyncEnabled(false),
-        mHWVsyncAvailable(false),
-        mDaltonize(false)
+        mUseDithering(0),
+        mPrefer16bpp(0)
 {
     ALOGI("SurfaceFlinger is starting");
 
@@ -2237,7 +2236,10 @@ status_t SurfaceFlinger::createNormalLayer(const sp<Client>& client,
 #ifdef NO_RGBX_8888
         format = PIXEL_FORMAT_RGB_565;
 #else
-        format = PIXEL_FORMAT_RGBX_8888;
+        if (mPrefer16bpp)
+            format = PIXEL_FORMAT_RGB_565;
+        else
+            format = PIXEL_FORMAT_RGBX_8888;
 #endif
         break;
     }
