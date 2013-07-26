@@ -51,7 +51,16 @@ using namespace android;
             "ldr   " #reg ", [" #reg ", #-15] \n"
     #endif
 
-    #define API_ENTRY(_api) __attribute__((noinline)) _api
+    #ifdef HAVE_ARM_TLS_REGISTER
+        #define GET_TLS(reg) \
+            "mrc p15, 0, " #reg ", c13, c0, 3 \n"
+    #else
+        #define GET_TLS(reg) \
+            "mov   " #reg ", #0xFFFF0FFF      \n"  \
+            "ldr   " #reg ", [" #reg ", #-15] \n"
+    #endif
+
+    #define API_ENTRY(_api) __attribute__((naked)) _api
 
     #define CALL_GL_API(_api, ...)                              \
          asm volatile(                                          \
