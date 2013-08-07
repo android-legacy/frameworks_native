@@ -2773,6 +2773,9 @@ status_t SurfaceFlinger::onTransact(
             const int pid = ipc->getCallingPid();
             const int uid = ipc->getCallingUid();
             if ((uid != AID_GRAPHICS) &&
+#if defined(BOARD_EGL_NEEDS_LEGACY_FB) || defined(USE_LEGACY_SCREENSHOT)
+                 (uid != AID_SYSTEM) &&
+#endif
                     !PermissionCache::checkPermission(sAccessSurfaceFlinger, pid, uid)) {
                 ALOGE("Permission Denial: "
                         "can't access SurfaceFlinger pid=%d, uid=%d", pid, uid);
@@ -2781,6 +2784,9 @@ status_t SurfaceFlinger::onTransact(
             break;
         }
         case CAPTURE_SCREEN:
+#if defined(BOARD_EGL_NEEDS_LEGACY_FB) || defined(USE_LEGACY_SCREENSHOT)
+        case CAPTURE_SCREEN_DEPRECATED:
+#endif
         {
             // codes that require permission check
             IPCThreadState* ipc = IPCThreadState::self();
@@ -3023,10 +3029,18 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
         virtual bool handler() {
             Mutex::Autolock _l(flinger->mStateLock);
             sp<const DisplayDevice> hw(flinger->getDisplayDevice(display));
-            bool useReadPixels = this->useReadPixels && !flinger->mGpuToCpuSupported;
-            result = flinger->captureScreenImplLocked(hw,
-                    producer, reqWidth, reqHeight, minLayerZ, maxLayerZ,
-                    useReadPixels);
+            if (!useReadPixels) {
+                result = flinger->captureScreenImplLocked(hw,
+                        producer, reqWidth, reqHeight, minLayerZ, maxLayerZ);
+            } else {
+#if defined(BOARD_EGL_NEEDS_LEGACY_FB) || defined(USE_LEGACY_SCREENSHOT)
+                // Should never get here
+                return BAD_VALUE;
+#else
+                result = flinger->captureScreenImplCpuConsumerLocked(hw,
+                        producer, reqWidth, reqHeight, minLayerZ, maxLayerZ);
+#endif
+            }
             static_cast<GraphicProducerWrapper*>(producer->asBinder().get())->exit(result);
             return true;
         }
@@ -3109,8 +3123,76 @@ status_t SurfaceFlinger::captureScreenImplLocked(
         const sp<const DisplayDevice>& hw,
         const sp<IGraphicBufferProducer>& producer,
         uint32_t reqWidth, uint32_t reqHeight,
-        uint32_t minLayerZ, uint32_t maxLayerZ,
-        bool useReadPixels)
+        uint32_t minLayerZ, uint32_t maxLayerZ)
+{
+    ATRACE_CALL();
+
+    // get screen geometry
+    const uint32_t hw_w = hw->getWidth();
+    const uint32_t hw_h = hw->getHeight();
+
+    // if we have secure windows on this display, never allow the screen capture
+    if (hw->getSecureLayerVisible()) {
+        ALOGW("FB is protected: PERMISSION_DENIED");
+        return PERMISSION_DENIED;
+    }
+
+    if ((reqWidth > hw_w) || (reqHeight > hw_h)) {
+        ALOGE("size mismatch (%d, %d) > (%d, %d)",
+                reqWidth, reqHeight, hw_w, hw_h);
+        return BAD_VALUE;
+    }
+
+    reqWidth = (!reqWidth) ? hw_w : reqWidth;
+    reqHeight = (!reqHeight) ? hw_h : reqHeight;
+
+    // Create a surface to render into
+    sp<Surface> surface = new Surface(producer);
+    ANativeWindow* const window = surface.get();
+
+    // set the buffer size to what the user requested
+    native_window_set_buffers_user_dimensions(window, reqWidth, reqHeight);
+
+    // and create the corresponding EGLSurface
+    EGLSurface eglSurface = eglCreateWindowSurface(
+            mEGLDisplay, mEGLConfig, window, NULL);
+    if (eglSurface == EGL_NO_SURFACE) {
+        ALOGE("captureScreenImplLocked: eglCreateWindowSurface() failed 0x%4x",
+                eglGetError());
+        return BAD_VALUE;
+    }
+
+    if (!eglMakeCurrent(mEGLDisplay, eglSurface, eglSurface, mEGLContext)) {
+        ALOGE("captureScreenImplLocked: eglMakeCurrent() failed 0x%4x",
+                eglGetError());
+        eglDestroySurface(mEGLDisplay, eglSurface);
+        return BAD_VALUE;
+    }
+
+    renderScreenImplLocked(hw, reqWidth, reqHeight, minLayerZ, maxLayerZ, false);
+
+    // and finishing things up...
+    if (eglSwapBuffers(mEGLDisplay, eglSurface) != EGL_TRUE) {
+        ALOGE("captureScreenImplLocked: eglSwapBuffers() failed 0x%4x",
+                eglGetError());
+        eglDestroySurface(mEGLDisplay, eglSurface);
+        return BAD_VALUE;
+    }
+
+    eglDestroySurface(mEGLDisplay, eglSurface);
+
+    return NO_ERROR;
+}
+
+status_t SurfaceFlinger::captureScreenImplCpuConsumerLocked(
+        const sp<const DisplayDevice>& hw,
+#if defined(BOARD_EGL_NEEDS_LEGACY_FB) || defined(USE_LEGACY_SCREENSHOT)
+        sp<IMemoryHeap>* heap, uint32_t* w, uint32_t* h,
+#else
+        const sp<IGraphicBufferProducer>& producer,
+#endif
+        uint32_t reqWidth, uint32_t reqHeight,
+        uint32_t minLayerZ, uint32_t maxLayerZ)
 {
     ATRACE_CALL();
 
@@ -3198,13 +3280,33 @@ status_t SurfaceFlinger::captureScreenImplLocked(
                             }
                         }
 
-                        if (DEBUG_SCREENSHOTS) {
-                            uint32_t* pixels = new uint32_t[reqWidth*reqHeight];
-                            getRenderEngine().readPixels(0, 0, reqWidth, reqHeight, pixels);
-                            checkScreenshot(reqWidth, reqHeight, reqWidth, pixels,
-                                    hw, minLayerZ, maxLayerZ);
-                            delete [] pixels;
-                        }
+    status_t result = NO_ERROR;
+    if (status == GL_FRAMEBUFFER_COMPLETE_OES) {
+
+        renderScreenImplLocked(hw, reqWidth, reqHeight, minLayerZ, maxLayerZ, true);
+
+        // Below we render the screenshot into the
+        // CpuConsumer using glReadPixels from our FBO.
+        // Some older drivers don't support the GL->CPU path so we
+        // have to wrap it with a CPU->CPU path, which is what
+        // glReadPixels essentially is.
+
+#if defined(BOARD_EGL_NEEDS_LEGACY_FB) || defined(USE_LEGACY_SCREENSHOT)
+        size_t size = reqWidth * reqHeight * 4;
+        // allocate shared memory large enough to hold the
+        // screen capture
+        sp<MemoryHeapBase> base(
+                new MemoryHeapBase(size, 0, "screen-capture") );
+        void *vaddr = base->getBase();
+        glReadPixels(0, 0, reqWidth, reqHeight,
+                GL_RGBA, GL_UNSIGNED_BYTE, vaddr);
+        if (glGetError() == GL_NO_ERROR) {
+            *heap = base;
+            *w = reqWidth;
+            *h = reqHeight;
+            result = NO_ERROR;
+        } else {
+            result = INVALID_OPERATION;
 
                     } else {
                         ALOGE("got GL_FRAMEBUFFER_COMPLETE_OES error while taking screenshot");
@@ -3226,14 +3328,42 @@ status_t SurfaceFlinger::captureScreenImplLocked(
     return result;
 }
 
-void SurfaceFlinger::checkScreenshot(size_t w, size_t s, size_t h, void const* vaddr,
-        const sp<const DisplayDevice>& hw, uint32_t minLayerZ, uint32_t maxLayerZ) {
-    if (DEBUG_SCREENSHOTS) {
-        for (size_t y=0 ; y<h ; y++) {
-            uint32_t const * p = (uint32_t const *)vaddr + y*s;
-            for (size_t x=0 ; x<w ; x++) {
-                if (p[x] != 0xFF000000) return;
-            }
+#if defined(BOARD_EGL_NEEDS_LEGACY_FB) || defined(USE_LEGACY_SCREENSHOT)
+status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
+        sp<IMemoryHeap>* heap,
+        uint32_t* outWidth, uint32_t* outHeight,
+        uint32_t reqWidth, uint32_t reqHeight,
+        uint32_t minLayerZ, uint32_t maxLayerZ)
+{
+    if (CC_UNLIKELY(display == 0))
+        return BAD_VALUE;
+
+    class MessageCaptureScreen : public MessageBase {
+        SurfaceFlinger* flinger;
+        sp<IBinder> display;
+        sp<IMemoryHeap>* heap;
+        uint32_t* outWidth;
+        uint32_t* outHeight;
+        uint32_t reqWidth;
+        uint32_t reqHeight;
+        uint32_t minLayerZ;
+        uint32_t maxLayerZ;
+        status_t result;
+    public:
+        MessageCaptureScreen(SurfaceFlinger* flinger,
+                const sp<IBinder>& display, sp<IMemoryHeap>* heap,
+                uint32_t* outWidth, uint32_t* outHeight,
+                uint32_t reqWidth, uint32_t reqHeight,
+                uint32_t minLayerZ, uint32_t maxLayerZ)
+            : flinger(flinger), display(display), heap(heap),
+              outWidth(outWidth), outHeight(outHeight),
+              reqWidth(reqWidth), reqHeight(reqHeight),
+              minLayerZ(minLayerZ), maxLayerZ(maxLayerZ),
+              result(PERMISSION_DENIED)
+        {
+        }
+        status_t getResult() const {
+            return result;
         }
         ALOGE("*** we just took a black screenshot ***\n"
                 "requested minz=%d, maxz=%d, layerStack=%d",
