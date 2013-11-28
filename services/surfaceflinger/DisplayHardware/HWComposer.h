@@ -242,7 +242,6 @@ public:
 
     enum {
         EVENT_VSYNC = HWC_EVENT_VSYNC,
-        EVENT_ORIENTATION = HWC_EVENT_ORIENTATION
     };
 
     void eventControl(int disp, int event, int enabled);
